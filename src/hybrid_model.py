@@ -10,10 +10,22 @@ of its output:
     Islam & Alam's BangDSA paper, but applied here to fine-tuned contextual
     embeddings instead of a frozen document vector.
 
-Trained with class-weighted cross-entropy, discriminative learning rates
-(lower for the encoder, higher for the head), linear warmup+decay, fp16,
-and early stopping on validation macro-F1 (not loss/accuracy), so the
-minority class can't be silently ignored.
+Trained with class-weighted (+ optionally label-smoothed) cross-entropy,
+discriminative learning rates (lower for the encoder, higher for the head),
+optional partial encoder freezing, linear warmup+decay, fp16, and early
+stopping on validation macro-F1 (not loss/accuracy), so the minority class
+can't be silently ignored.
+
+Round-1 Kaggle results (full fine-tune, head_lr=1e-3, dropout=0.3, no
+freezing) showed clear overfitting: train loss collapsed from 0.91->0.20
+over 6 epochs while val loss rose from 0.87->2.11, and even the best
+val-macro-F1 checkpoint (epoch 3, 0.65) generalized poorly to the held-out
+test set (0.50 macro-F1, worse than the paper's 60% accuracy on 3-class).
+2-class showed a milder version of the same pattern. The changes in this
+version (lower head/encoder LR, label smoothing via the criterion,
+higher dropout, optional layer freezing, an LR-decay horizon decoupled
+from the early-stopping cap, and per-epoch history for plotting) target
+that overfitting directly.
 """
 
 import copy
@@ -59,7 +71,7 @@ class BanglaBertHybrid(nn.Module):
     def __init__(self, model_name: str = DEFAULT_MODEL_NAME, num_labels: int = 3,
                  conv_filters: int = 128, conv_kernel: int = 3,
                  lstm_hidden: int = 128, fusion_dim: int = 256,
-                 dropout: float = 0.3):
+                 dropout: float = 0.4):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(model_name)
         hidden_size = self.encoder.config.hidden_size
@@ -71,6 +83,11 @@ class BanglaBertHybrid(nn.Module):
         self.lstm = nn.LSTM(conv_filters, lstm_hidden, num_layers=1,
                              bidirectional=True, batch_first=True)
 
+        # Extra dropout on each branch before fusion, on top of the dropout
+        # before the classifier -- cheap additional regularization against
+        # the overfitting seen in round 1.
+        self.branch_dropout = nn.Dropout(dropout)
+
         fused_dim = hidden_size + lstm_hidden * 2
         self.fc1 = nn.Linear(fused_dim, fusion_dim)
         self.dropout = nn.Dropout(dropout)
@@ -79,7 +96,7 @@ class BanglaBertHybrid(nn.Module):
     def forward(self, input_ids, attention_mask):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         seq_output = outputs.last_hidden_state          # [B, L, H]
-        cls_repr = seq_output[:, 0, :]                    # [B, H]
+        cls_repr = self.branch_dropout(seq_output[:, 0, :])   # [B, H]
 
         x = seq_output.permute(0, 2, 1)                   # [B, H, L]
         x = self.relu(self.conv(x))                       # [B, C, L]
@@ -87,6 +104,7 @@ class BanglaBertHybrid(nn.Module):
         x = x.permute(0, 2, 1)                             # [B, L//2, C]
         _, (h_n, _) = self.lstm(x)                         # h_n: [2, B, lstm_hidden]
         lstm_repr = torch.cat((h_n[-2], h_n[-1]), dim=1)   # [B, lstm_hidden*2]
+        lstm_repr = self.branch_dropout(lstm_repr)
 
         fused = torch.cat((cls_repr, lstm_repr), dim=1)
         x = self.relu(self.fc1(fused))
@@ -94,16 +112,37 @@ class BanglaBertHybrid(nn.Module):
         return self.classifier(x)
 
 
+def freeze_encoder_layers(model: BanglaBertHybrid, num_layers: int) -> None:
+    """Freeze the embeddings + the bottom `num_layers` transformer layers of
+    the encoder, leaving the top layers + hybrid head trainable.
+
+    Full end-to-end fine-tuning of all 12 BanglaBERT layers on a ~9-12k
+    example dataset is prone to overfitting (round-1 results). Freezing the
+    lower layers -- which mostly encode generic syntax/morphology rather
+    than task-specific sentiment signal -- reduces effective trainable
+    capacity without giving up fine-tuning entirely.
+    """
+    for param in model.encoder.embeddings.parameters():
+        param.requires_grad = False
+    layers = model.encoder.encoder.layer
+    for layer in layers[:num_layers]:
+        for param in layer.parameters():
+            param.requires_grad = False
+    print(f"[freeze] froze embeddings + bottom {num_layers}/{len(layers)} encoder layers")
+
+
 def build_optimizer(model: BanglaBertHybrid, encoder_lr: float, head_lr: float,
                      weight_decay: float = 0.01):
     """Discriminative-LR AdamW: encoder gets a small LR (it's already
-    pretrained), the new hybrid head gets a much larger one (it starts from
+    pretrained), the new hybrid head gets a larger one (it starts from
     random init). bias/LayerNorm params are excluded from weight decay,
-    standard practice for transformer fine-tuning."""
+    standard practice for transformer fine-tuning. Frozen params (see
+    freeze_encoder_layers) are skipped entirely so they don't sit in the
+    optimizer doing nothing."""
     no_decay = ['bias', 'LayerNorm.weight']
-    encoder_params = list(model.encoder.named_parameters())
+    encoder_params = [(n, p) for n, p in model.encoder.named_parameters() if p.requires_grad]
     head_params = [(n, p) for n, p in model.named_parameters()
-                   if not n.startswith('encoder.')]
+                   if not n.startswith('encoder.') and p.requires_grad]
 
     groups = [
         {'params': [p for n, p in encoder_params if not any(nd in n for nd in no_decay)],
@@ -115,6 +154,8 @@ def build_optimizer(model: BanglaBertHybrid, encoder_lr: float, head_lr: float,
         {'params': [p for n, p in head_params if any(nd in n for nd in no_decay)],
          'lr': head_lr, 'weight_decay': 0.0},
     ]
+    # Drop empty groups (e.g. if everything in one bucket was frozen).
+    groups = [g for g in groups if len(g['params']) > 0]
     return torch.optim.AdamW(groups)
 
 
@@ -180,15 +221,26 @@ def evaluate(model, loader, criterion, device, label_names=None):
 
 
 def train_with_early_stopping(model, train_loader, val_loader, criterion, device, *,
-                               encoder_lr: float = 2e-5, head_lr: float = 1e-3,
+                               encoder_lr: float = 1e-5, head_lr: float = 3e-4,
                                weight_decay: float = 0.01, warmup_ratio: float = 0.06,
-                               epochs: int = 15, patience: int = 3,
-                               grad_clip: float = 1.0, use_fp16: bool = True,
-                               label_names=None):
+                               epochs: int = 15, lr_decay_epochs: int = 8,
+                               patience: int = 3, grad_clip: float = 1.0,
+                               use_fp16: bool = True, label_names=None):
     """Full training loop with early stopping on validation macro-F1.
-    Returns (model_with_best_weights_loaded, best_val_macro_f1)."""
+
+    `lr_decay_epochs` (not `epochs`) sizes the linear warmup+decay schedule.
+    Round-1 runs stopped at epoch 5-6 while the scheduler assumed a 15-epoch
+    horizon, so the LR never fully decayed by the time the best checkpoint
+    was hit -- decoupling the two keeps the LR curve realistic even though
+    `epochs` is still the hard cap the loop can run to if early stopping
+    doesn't trigger.
+
+    Returns (model_with_best_weights_loaded, best_val_macro_f1, history), where
+    history is a list of per-epoch dicts (epoch, train_loss, val_loss, val_acc,
+    val_macro_f1) suitable for plotting.
+    """
     optimizer = build_optimizer(model, encoder_lr, head_lr, weight_decay)
-    total_steps = len(train_loader) * epochs
+    total_steps = len(train_loader) * lr_decay_epochs
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(total_steps * warmup_ratio),
@@ -199,6 +251,7 @@ def train_with_early_stopping(model, train_loader, val_loader, criterion, device
     best_macro_f1 = -1.0
     best_state = None
     epochs_no_improve = 0
+    history = []
 
     for epoch in range(epochs):
         train_loss = train_epoch(model, train_loader, optimizer, scheduler,
@@ -209,6 +262,14 @@ def train_with_early_stopping(model, train_loader, val_loader, criterion, device
               f"val_loss {val_metrics['loss']:.4f} | "
               f"val_acc {val_metrics['accuracy'] * 100:.2f}% | "
               f"val_macro_f1 {val_metrics['macro_f1']:.4f}")
+
+        history.append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'val_loss': val_metrics['loss'],
+            'val_acc': val_metrics['accuracy'],
+            'val_macro_f1': val_metrics['macro_f1'],
+        })
 
         if val_metrics['macro_f1'] > best_macro_f1:
             best_macro_f1 = val_metrics['macro_f1']
@@ -222,4 +283,40 @@ def train_with_early_stopping(model, train_loader, val_loader, criterion, device
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    return model, best_macro_f1
+    return model, best_macro_f1, history
+
+
+def plot_history(history, title: str = ''):
+    """Plot train/val loss and val accuracy/macro-F1 per epoch.
+
+    Kept as a plain matplotlib helper (not saved to disk) so it renders
+    inline in a Kaggle/Jupyter notebook right after training.
+    """
+    import matplotlib.pyplot as plt
+
+    epochs = [h['epoch'] for h in history]
+    train_loss = [h['train_loss'] for h in history]
+    val_loss = [h['val_loss'] for h in history]
+    val_acc = [h['val_acc'] for h in history]
+    val_macro_f1 = [h['val_macro_f1'] for h in history]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+    axes[0].plot(epochs, train_loss, marker='o', label='train loss')
+    axes[0].plot(epochs, val_loss, marker='o', label='val loss')
+    axes[0].set_xlabel('epoch')
+    axes[0].set_ylabel('loss')
+    axes[0].set_title(f'{title} -- loss')
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(epochs, val_acc, marker='o', label='val accuracy')
+    axes[1].plot(epochs, val_macro_f1, marker='o', label='val macro-F1')
+    axes[1].set_xlabel('epoch')
+    axes[1].set_ylabel('score')
+    axes[1].set_title(f'{title} -- val accuracy / macro-F1')
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+
+    fig.tight_layout()
+    plt.show()
