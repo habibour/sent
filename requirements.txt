@@ -1,0 +1,12 @@
+# Core ML stack. Kaggle/Colab images already ship compatible torch,
+# transformers, pandas, numpy — only install these locally if reproducing
+# outside such an environment.
+torch>=2.0
+transformers>=4.30
+pandas>=2.0
+numpy>=1.24
+
+# Bengali NLP, used by src/preprocess.py (bnlp_toolkit>=4 API: `from bnlp import BasicTokenizer`)
+bnlp_toolkit>=4.0
+bangla-stemmer>=1.0
+nltk>=3.8
