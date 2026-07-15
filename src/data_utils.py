@@ -23,6 +23,12 @@ from sklearn.utils.class_weight import compute_class_weight
 _URL_RE = re.compile(r'(https?://\S+|www\.\S+)')
 _WS_RE = re.compile(r'\s+')
 
+# Zero-width joiner/non-joiner and similar invisible Unicode artifacts that
+# show up in scraped Bengali web text (the original preprocess.py's _GONE
+# list drops whole rows containing these; here we strip just the characters,
+# since dropping the row loses a labeled example over a few invisible bytes).
+_ZW_RE = re.compile('[​‌‍‎‏﻿]')
+
 try:
     from normalizer import normalize as _bnorm
     _HAS_NORMALIZER = True
@@ -31,6 +37,24 @@ except ImportError:
     print("[data_utils] 'normalizer' package not found -- skipping BanglaBERT's "
           "official text normalization step. Install with:\n"
           "  pip install git+https://github.com/csebuetnlp/normalizer.git")
+
+
+def verify_normalizer() -> bool:
+    """Explicit, unambiguous check of whether BanglaBERT's official
+    normalizer is active -- call this once at the top of a training run so
+    it's impossible to miss in the logs (relying on the absence of the
+    import-failure warning above is easy to overlook).
+    """
+    if not _HAS_NORMALIZER:
+        print("[verify_normalizer] NOT ACTIVE -- 'normalizer' package is not "
+              "installed. Text normalization is being skipped.")
+        return False
+    sample = "আমি  ভালো​আছি।।।"  # deliberately messy: double space + ZWSP + repeated danda
+    out = _bnorm(sample)
+    changed = out != sample
+    print(f"[verify_normalizer] ACTIVE -- sample {sample!r} -> {out!r} "
+          f"(changed={changed})")
+    return True
 
 
 def bangla_normalize(text: str) -> str:
@@ -45,13 +69,20 @@ def bangla_normalize(text: str) -> str:
 
 
 def clean_light(df: pd.DataFrame, text_col: str = 'Data') -> pd.DataFrame:
-    """Minimal cleaning for transformer fine-tuning: strip URLs, collapse
-    whitespace, apply the BanglaBERT normalizer. Keeps punctuation such as
-    '!'/'?' since it carries sentiment signal, and does not stem.
+    """Minimal cleaning for transformer fine-tuning: strip URLs and
+    zero-width Unicode artifacts, collapse whitespace, apply the BanglaBERT
+    normalizer. Keeps punctuation such as '!'/'?' since it carries sentiment
+    signal, and does not stem.
     """
     df = df.copy().reset_index(drop=True)
     texts = df[text_col].astype(str)
+
+    n_zw = texts.str.contains(_ZW_RE, regex=True).sum()
+    if n_zw:
+        print(f"[clean_light] stripping zero-width Unicode artifacts from {n_zw} rows")
+
     texts = texts.str.replace(_URL_RE, ' ', regex=True)
+    texts = texts.str.replace(_ZW_RE, '', regex=True)
     texts = texts.apply(bangla_normalize)
     texts = texts.str.replace(_WS_RE, ' ', regex=True).str.strip()
     df[text_col] = texts
