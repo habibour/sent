@@ -136,12 +136,26 @@ def stratified_split(df: pd.DataFrame, label_col: str = 'label',
     return train_df.reset_index(drop=True), val_df.reset_index(drop=True)
 
 
-def get_class_weights(labels, num_labels: int):
-    """Inverse-frequency class weights for nn.CrossEntropyLoss(weight=...)."""
+def get_class_weights(labels, num_labels: int, multipliers=None):
+    """Inverse-frequency class weights for nn.CrossEntropyLoss(weight=...).
+
+    `multipliers`, if given, is a dict {label: factor} or a length-`num_labels`
+    sequence applied on top of the balanced weights -- e.g. to push a
+    chronically under-recalled class (Neutral in 3class, Positive in 2class)
+    harder than plain inverse-frequency balancing does. This trades away some
+    majority-class recall for minority-class recall, so it should be swept
+    and checked against both, not just macro-F1.
+    """
     import torch
     classes = np.arange(num_labels)
     weights = compute_class_weight(class_weight='balanced', classes=classes,
                                     y=np.asarray(labels))
+    if multipliers is not None:
+        if isinstance(multipliers, dict):
+            mult = np.array([multipliers.get(c, 1.0) for c in classes], dtype=float)
+        else:
+            mult = np.asarray(multipliers, dtype=float)
+        weights = weights * mult
     return torch.tensor(weights, dtype=torch.float)
 
 
