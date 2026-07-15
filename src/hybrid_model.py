@@ -286,6 +286,51 @@ def train_with_early_stopping(model, train_loader, val_loader, criterion, device
     return model, best_macro_f1, history
 
 
+def train_fixed_epochs(model, train_loader, criterion, device, *,
+                        encoder_lr: float = 1e-5, head_lr: float = 3e-4,
+                        weight_decay: float = 0.01, warmup_ratio: float = 0.06,
+                        epochs: int, grad_clip: float = 1.0, use_fp16: bool = True):
+    """Phase 2: train for a fixed epoch count with NO held-out validation set
+    and NO early stopping -- used for the final full-data run once the val
+    split (train_with_early_stopping) has already told us roughly which
+    epoch the model peaks at.
+
+    Held-out val is a methodology tool for choosing when to stop, not a
+    resource the final model should be denied at test time -- once the
+    epoch count is fixed from earlier val-based runs, folding val back into
+    train gives the model ~5-15% more labeled examples for the same
+    train/test comparison (test.csv is never touched here or anywhere else
+    in training). `epochs` has no default: it must be chosen deliberately
+    from a prior train_with_early_stopping run's history (see the
+    'full-data' notebook section), not left at some arbitrary number.
+
+    Since there's no early stopping to potentially cut the run short, the
+    warmup+decay schedule is sized to the full `epochs` directly (no
+    `lr_decay_epochs` decoupling needed here).
+
+    Returns (model, history), where history is a list of per-epoch dicts
+    with only `epoch`/`train_loss` (no val_* keys -- there is no val set in
+    this mode).
+    """
+    optimizer = build_optimizer(model, encoder_lr, head_lr, weight_decay)
+    total_steps = len(train_loader) * epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_steps * warmup_ratio),
+        num_training_steps=total_steps,
+    )
+    scaler = torch.cuda.amp.GradScaler() if (use_fp16 and device.type == 'cuda') else None
+
+    history = []
+    for epoch in range(epochs):
+        train_loss = train_epoch(model, train_loader, optimizer, scheduler,
+                                  criterion, device, scaler, grad_clip)
+        print(f"Epoch {epoch + 1:02d}/{epochs} | train_loss {train_loss:.4f}")
+        history.append({'epoch': epoch + 1, 'train_loss': train_loss})
+
+    return model, history
+
+
 def plot_history(history, title: str = ''):
     """Plot train/val loss and val accuracy/macro-F1 per epoch.
 
