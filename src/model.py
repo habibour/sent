@@ -1,4 +1,7 @@
-"""BERT+GRU sentiment model, ported from Codes/2-class/BERT_w_GRU.ipynb.
+"""BERT+GRU sentiment model, ported from the original paper's
+Codes/2-class/BERT_w_GRU.ipynb (github.com/KhondokerIslam/Bengali_Sentiment;
+also in this repo's own git history prior to the cleanup commit that
+removed the raw notebooks in favor of this module).
 
 The original notebook uses the legacy torchtext.data (Field/TabularDataset/
 BucketIterator) API, which was removed from modern torchtext and has no

@@ -5,8 +5,13 @@ torch>=2.0
 transformers>=4.30
 pandas>=2.0
 numpy>=1.24
+scikit-learn>=1.3
 
 # Bengali NLP, used by src/preprocess.py (bnlp_toolkit>=4 API: `from bnlp import BasicTokenizer`)
 bnlp_toolkit>=4.0
 bangla-stemmer>=1.0
 nltk>=3.8
+
+# Official BanglaBERT text normalizer, used by src/data_utils.py for the
+# hybrid pipeline. Falls back to unnormalized text if not installed.
+# pip install git+https://github.com/csebuetnlp/normalizer.git
