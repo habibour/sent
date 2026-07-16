@@ -23,11 +23,17 @@ from sklearn.utils.class_weight import compute_class_weight
 _URL_RE = re.compile(r'(https?://\S+|www\.\S+)')
 _WS_RE = re.compile(r'\s+')
 
-# Zero-width joiner/non-joiner and similar invisible Unicode artifacts that
-# show up in scraped Bengali web text (the original preprocess.py's _GONE
-# list drops whole rows containing these; here we strip just the characters,
-# since dropping the row loses a labeled example over a few invisible bytes).
-_ZW_RE = re.compile('[​‌‍‎‏﻿]')
+# Zero-width space (U+200B) and word joiner (U+2060) -- the only two
+# invisible-Unicode characters BanglaBERT's own normalizer (csebuetnlp/
+# normalizer, UNICODE_REPLACEMENTS) treats as noise to strip. Narrowed from
+# an earlier version that also stripped ZWNJ (U+200C) and ZWJ (U+200D):
+# those are *not* noise in Bengali -- they control conjunct/non-conjunct
+# glyph formation and are legitimate characters BanglaBERT's subword
+# vocabulary expects intact. An audit of Dataset/train.csv found only 4 rows
+# with genuine ZWSP noise, versus 135 rows (442 occurrences) with ZWNJ and
+# 94 rows (131 occurrences) with ZWJ that the old blanket regex was
+# incorrectly stripping -- over 98% of what it "cleaned" was real text.
+_ZW_RE = re.compile('[​⁠]')
 
 try:
     from normalizer import normalize as _bnorm

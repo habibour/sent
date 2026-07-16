@@ -21,11 +21,28 @@ freezing) showed clear overfitting: train loss collapsed from 0.91->0.20
 over 6 epochs while val loss rose from 0.87->2.11, and even the best
 val-macro-F1 checkpoint (epoch 3, 0.65) generalized poorly to the held-out
 test set (0.50 macro-F1, worse than the paper's 60% accuracy on 3-class).
-2-class showed a milder version of the same pattern. The changes in this
-version (lower head/encoder LR, label smoothing via the criterion,
-higher dropout, optional layer freezing, an LR-decay horizon decoupled
-from the early-stopping cap, and per-epoch history for plotting) target
-that overfitting directly.
+2-class showed a milder version of the same pattern.
+
+Round 2 (encoder_lr=1e-5, head_lr=3e-4, dropout=0.4, label_smoothing=0.1,
+6 layers frozen) fixed the overfitting -- train/val loss no longer diverge
+-- but 3-class test accuracy barely moved (55.50%, still below the paper's
+60% baseline), while 2-class did clear its baseline (75.60% vs 71%).
+Freezing bottom layers turned out to remove too much of the encoder's
+task-adaptation capacity for the harder 3-class problem, trading away
+signal for regularization it didn't need once LR/dropout were already
+fixed.
+
+This version switches strategy: no layer freezing (all 12 layers trainable
+again, `num_frozen_layers=0`), combined with FGM (Fast Gradient Method)
+adversarial training as the regularizer instead, following the recipe from
+the BLP-2023 shared-task 2nd-place system (Knowdee, github.com/KnowdeeAI/
+blp_task2_knowdee) -- full fine-tuning + FGM, no layer freezing, is exactly
+what that system used to reach 72-74% accuracy on a related (larger,
+cleaner) Bengali sentiment dataset. FGM perturbs the word-embedding output
+along its gradient direction and takes a second backward pass on the
+perturbed input each step, which regularizes the encoder toward a flatter
+loss surface without shrinking its trainable capacity the way layer
+freezing does.
 """
 
 import copy
@@ -112,6 +129,47 @@ class BanglaBertHybrid(nn.Module):
         return self.classifier(x)
 
 
+class FGM:
+    """Fast Gradient Method adversarial training, ported from the BLP-2023
+    2nd-place system (github.com/KnowdeeAI/blp_task2_knowdee,
+    train/adv_trainer.py). Perturbs the word-embedding weights along the
+    direction of their own gradient (normalized, scaled by `epsilon`) after
+    the clean backward pass, takes a second forward+backward on the
+    perturbed weights, then restores the clean weights before the optimizer
+    step actually applies. The clean-loss gradient and the adversarial-loss
+    gradient both accumulate on `.grad`, so the step moves the model toward
+    a minimum that's robust to small embedding-space perturbations -- a
+    regularizer that doesn't cost any trainable capacity, unlike layer
+    freezing (see freeze_encoder_layers).
+
+    `emb_name` is matched by substring against `named_parameters()`, so it
+    doesn't need to know the encoder's exact nesting -- for
+    BanglaBertHybrid.encoder (an AutoModel), the real parameter name is
+    `encoder.embeddings.word_embeddings.weight`, which contains
+    "word_embeddings".
+    """
+
+    def __init__(self, model: nn.Module, emb_name: str = 'word_embeddings'):
+        self.model = model
+        self.emb_name = emb_name
+        self.backup = {}
+
+    def attack(self, epsilon: float = 1.0):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and self.emb_name in name and param.grad is not None:
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0 and not torch.isnan(norm):
+                    r_at = epsilon * param.grad / norm
+                    param.data.add_(r_at)
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
 def freeze_encoder_layers(model: BanglaBertHybrid, num_layers: int) -> None:
     """Freeze the embeddings + the bottom `num_layers` transformer layers of
     the encoder, leaving the top layers + hybrid head trainable.
@@ -160,7 +218,13 @@ def build_optimizer(model: BanglaBertHybrid, encoder_lr: float, head_lr: float,
 
 
 def train_epoch(model, loader, optimizer, scheduler, criterion, device,
-                 scaler=None, grad_clip: float = 1.0):
+                 scaler=None, grad_clip: float = 1.0, fgm: 'FGM | None' = None,
+                 fgm_epsilon: float = 1.0):
+    """`fgm`, if given, runs one FGM adversarial step per batch after the
+    clean backward pass: perturb the word-embedding weights, do a second
+    forward+backward on the perturbed model, restore the clean weights, then
+    clip+step as usual. Both the clean and adversarial gradients accumulate
+    into `.grad` before the single optimizer.step() call."""
     model.train()
     total_loss = 0.0
     for batch in loader:
@@ -174,6 +238,15 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device,
                 logits = model(input_ids, attention_mask)
                 loss = criterion(logits, labels)
             scaler.scale(loss).backward()
+
+            if fgm is not None:
+                fgm.attack(fgm_epsilon)
+                with torch.cuda.amp.autocast():
+                    logits_adv = model(input_ids, attention_mask)
+                    loss_adv = criterion(logits_adv, labels)
+                scaler.scale(loss_adv).backward()
+                fgm.restore()
+
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
@@ -182,6 +255,14 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device,
             logits = model(input_ids, attention_mask)
             loss = criterion(logits, labels)
             loss.backward()
+
+            if fgm is not None:
+                fgm.attack(fgm_epsilon)
+                logits_adv = model(input_ids, attention_mask)
+                loss_adv = criterion(logits_adv, labels)
+                loss_adv.backward()
+                fgm.restore()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         scheduler.step()
@@ -225,7 +306,8 @@ def train_with_early_stopping(model, train_loader, val_loader, criterion, device
                                weight_decay: float = 0.01, warmup_ratio: float = 0.06,
                                epochs: int = 15, lr_decay_epochs: int = 8,
                                patience: int = 3, grad_clip: float = 1.0,
-                               use_fp16: bool = True, label_names=None):
+                               use_fp16: bool = True, label_names=None,
+                               use_fgm: bool = False, fgm_epsilon: float = 1.0):
     """Full training loop with early stopping on validation macro-F1.
 
     `lr_decay_epochs` (not `epochs`) sizes the linear warmup+decay schedule.
@@ -234,6 +316,12 @@ def train_with_early_stopping(model, train_loader, val_loader, criterion, device
     was hit -- decoupling the two keeps the LR curve realistic even though
     `epochs` is still the hard cap the loop can run to if early stopping
     doesn't trigger.
+
+    `use_fgm` enables FGM adversarial training (see the FGM class) as the
+    anti-overfitting regularizer in place of layer freezing -- pass
+    `num_frozen_layers=0` to freeze_encoder_layers (i.e. don't call it) when
+    using this, since the two strategies address the same problem and
+    stacking them just wastes trainable capacity for no extra benefit.
 
     Returns (model_with_best_weights_loaded, best_val_macro_f1, history), where
     history is a list of per-epoch dicts (epoch, train_loss, val_loss, val_acc,
@@ -247,6 +335,7 @@ def train_with_early_stopping(model, train_loader, val_loader, criterion, device
         num_training_steps=total_steps,
     )
     scaler = torch.cuda.amp.GradScaler() if (use_fp16 and device.type == 'cuda') else None
+    fgm = FGM(model) if use_fgm else None
 
     best_macro_f1 = -1.0
     best_state = None
@@ -255,7 +344,8 @@ def train_with_early_stopping(model, train_loader, val_loader, criterion, device
 
     for epoch in range(epochs):
         train_loss = train_epoch(model, train_loader, optimizer, scheduler,
-                                  criterion, device, scaler, grad_clip)
+                                  criterion, device, scaler, grad_clip,
+                                  fgm=fgm, fgm_epsilon=fgm_epsilon)
         val_metrics = evaluate(model, val_loader, criterion, device, label_names)
 
         print(f"Epoch {epoch + 1:02d} | train_loss {train_loss:.4f} | "
@@ -289,7 +379,8 @@ def train_with_early_stopping(model, train_loader, val_loader, criterion, device
 def train_fixed_epochs(model, train_loader, criterion, device, *,
                         encoder_lr: float = 1e-5, head_lr: float = 3e-4,
                         weight_decay: float = 0.01, warmup_ratio: float = 0.06,
-                        epochs: int, grad_clip: float = 1.0, use_fp16: bool = True):
+                        epochs: int, grad_clip: float = 1.0, use_fp16: bool = True,
+                        use_fgm: bool = False, fgm_epsilon: float = 1.0):
     """Phase 2: train for a fixed epoch count with NO held-out validation set
     and NO early stopping -- used for the final full-data run once the val
     split (train_with_early_stopping) has already told us roughly which
@@ -320,11 +411,13 @@ def train_fixed_epochs(model, train_loader, criterion, device, *,
         num_training_steps=total_steps,
     )
     scaler = torch.cuda.amp.GradScaler() if (use_fp16 and device.type == 'cuda') else None
+    fgm = FGM(model) if use_fgm else None
 
     history = []
     for epoch in range(epochs):
         train_loss = train_epoch(model, train_loader, optimizer, scheduler,
-                                  criterion, device, scaler, grad_clip)
+                                  criterion, device, scaler, grad_clip,
+                                  fgm=fgm, fgm_epsilon=fgm_epsilon)
         print(f"Epoch {epoch + 1:02d}/{epochs} | train_loss {train_loss:.4f}")
         history.append({'epoch': epoch + 1, 'train_loss': train_loss})
 
